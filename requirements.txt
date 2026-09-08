@@ -1,0 +1,3 @@
+boto3
+pytest
+moto[s3,dynamodb,glue,sns,events]

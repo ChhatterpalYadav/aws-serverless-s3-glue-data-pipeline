@@ -1,0 +1,659 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DNB Assignment 3 - S3-triggered Glue automation pipeline. Full stack:
+  S3 -> SNS -> Lambda(SaveS3Config) + Lambda(RunGlueJob) -> Glue Jobs ->
+  EventBridge -> Lambda(GlueJobSuccess: Crawler+Athena) / Lambda(GlueJobFailure: SNS email).
+
+Parameters:
+
+  CodeBucketName:
+    Type: String
+    Description: Name of the pre-existing S3 bucket holding zipped Lambda code and Glue scripts (created by deploy.py before this stack runs)
+
+  SaveS3ConfigCodeKey:
+    Type: String
+    Default: lambda_save_s3_config.zip
+
+  RunGlueJobCodeKey:
+    Type: String
+    Default: lambda_run_glue_job.zip
+
+  GlueJobSuccessCodeKey:
+    Type: String
+    Default: lambda_glue_job_success.zip
+
+  GlueJobFailureCodeKey:
+    Type: String
+    Default: lambda_glue_job_failure.zip
+
+  DynamoDBTableName:
+    Type: String
+    Default: DNBAssignment3FileConfig
+
+  GlueDatabaseName:
+    Type: String
+    Default: dnb_assignment3_database
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive pipeline failure notifications (you must confirm the SNS subscription email after first deploy)
+
+Resources:
+
+  
+  FileConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: object_key
+          AttributeType: S
+        - AttributeName: version_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: object_key
+          KeyType: HASH
+        - AttributeName: version_id
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  
+  S3EventTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: DNBAssignment3-S3EventTopic
+
+  S3EventTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref S3EventTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ToPublish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref S3EventTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::dnb-assignment3-source-${AWS::AccountId}"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3EventTopicPolicy
+    Properties:
+      BucketName: !Sub "dnb-assignment3-source-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Topic: !Ref S3EventTopic
+
+  
+  CrawlerOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "dnb-assignment3-crawler-output-${AWS::AccountId}"
+
+  
+  AthenaOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "dnb-assignment3-athena-output-${AWS::AccountId}"
+
+  
+  FailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: DNBAssignment3-FailureTopic
+
+  FailureTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FailureTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+
+  
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DNBAssignment3-Glue-Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueJobsAndCrawlersAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub "arn:aws:s3:::dnb-assignment3-source-${AWS::AccountId}/*"
+                  - !Sub "arn:aws:s3:::${CodeBucketName}/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt CrawlerOutputBucket.Arn
+                  - !Sub "${CrawlerOutputBucket.Arn}/*"
+
+  
+  CsvJob0To5kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: csv_0_5kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/csv_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  CsvJob5To10kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: csv_5_10kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/csv_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  CsvJobAbove10kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: csv_above_10kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/csv_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  JsonJob0To5kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: json_0_5kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/json_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  JsonJob5To10kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: json_5_10kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/json_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  JsonJobAbove10kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: json_above_10kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/json_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  TextJob0To5kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: text_0_5kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/text_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  TextJob5To10kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: text_5_10kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/text_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  TextJobAbove10kb:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: text_above_10kb
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${CodeBucketName}/text_job.py"
+      DefaultArguments:
+        "--OUTPUT_BUCKET": !Ref CrawlerOutputBucket
+        "--extra-py-files": !Sub "s3://${CodeBucketName}/glue_utils.py"
+
+  
+  TextFilesCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: TextFilesCrawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${CrawlerOutputBucket}/text/"
+
+  CSVFilesCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: CSVFilesCrawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${CrawlerOutputBucket}/csv/"
+
+  JSONFilesCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: JSONFilesCrawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${CrawlerOutputBucket}/json/"
+
+  
+  SaveS3ConfigExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DNBAssignment3-SaveS3Config-Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SaveS3ConfigAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectTagging
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub "arn:aws:s3:::dnb-assignment3-source-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt FileConfigTable.Arn
+
+  SaveS3ConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DNBAssignment3-SaveS3Config
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt SaveS3ConfigExecutionRole.Arn
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref SaveS3ConfigCodeKey
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDBTableName
+
+  SaveS3ConfigInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SaveS3ConfigFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref S3EventTopic
+
+  SaveS3ConfigSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref S3EventTopic
+      Protocol: lambda
+      Endpoint: !GetAtt SaveS3ConfigFunction.Arn
+
+  
+  RunGlueJobExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DNBAssignment3-RunGlueJob-Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RunGlueJobAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt FileConfigTable.Arn
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/*"
+
+  RunGlueJobFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DNBAssignment3-RunGlueJob
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt RunGlueJobExecutionRole.Arn
+      Timeout: 60
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref RunGlueJobCodeKey
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDBTableName
+
+  RunGlueJobInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RunGlueJobFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref S3EventTopic
+
+  RunGlueJobSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref S3EventTopic
+      Protocol: lambda
+      Endpoint: !GetAtt RunGlueJobFunction.Arn
+
+  
+  GlueJobSuccessExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DNBAssignment3-GlueJobSuccess-Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueJobSuccessAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt FileConfigTable.Arn
+              - Effect: Allow
+                Action:
+                  - glue:GetCrawler
+                  - glue:StartCrawler
+                  - glue:GetTables
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:GetPartitions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt CrawlerOutputBucket.Arn
+                  - !Sub "${CrawlerOutputBucket.Arn}/*"
+                  - !GetAtt AthenaOutputBucket.Arn
+                  - !Sub "${AthenaOutputBucket.Arn}/*"
+
+  GlueJobSuccessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DNBAssignment3-GlueJobSuccess
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt GlueJobSuccessExecutionRole.Arn
+      Timeout: 300
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref GlueJobSuccessCodeKey
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDBTableName
+          GLUE_DATABASE_NAME: !Ref GlueDatabaseName
+          ATHENA_OUTPUT_BUCKET_NAME: !Ref AthenaOutputBucket
+
+  GlueJobSuccessInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GlueJobSuccessFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeGlueJobSuccessRule.Arn
+
+  EventBridgeGlueJobSuccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DNBAssignment3-GlueJobSuccessRule
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - "Glue Job State Change"
+        detail:
+          jobName:
+            - csv_0_5kb
+            - csv_5_10kb
+            - csv_above_10kb
+            - json_0_5kb
+            - json_5_10kb
+            - json_above_10kb
+            - text_0_5kb
+            - text_5_10kb
+            - text_above_10kb
+          state:
+            - SUCCEEDED
+      Targets:
+        - Arn: !GetAtt GlueJobSuccessFunction.Arn
+          Id: GlueJobSuccessTarget
+
+  
+  GlueJobFailureExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DNBAssignment3-GlueJobFailure-Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueJobFailureAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt FileConfigTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref FailureTopic
+
+  GlueJobFailureFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DNBAssignment3-GlueJobFailure
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt GlueJobFailureExecutionRole.Arn
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref GlueJobFailureCodeKey
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref DynamoDBTableName
+          FAILURE_TOPIC_ARN: !Ref FailureTopic
+
+  GlueJobFailureInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GlueJobFailureFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeGlueJobFailureRule.Arn
+
+  EventBridgeGlueJobFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DNBAssignment3-GlueJobFailureRule
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - "Glue Job State Change"
+        detail:
+          jobName:
+            - csv_0_5kb
+            - csv_5_10kb
+            - csv_above_10kb
+            - json_0_5kb
+            - json_5_10kb
+            - json_above_10kb
+            - text_0_5kb
+            - text_5_10kb
+            - text_above_10kb
+          state:
+            - FAILED
+      Targets:
+        - Arn: !GetAtt GlueJobFailureFunction.Arn
+          Id: GlueJobFailureTarget
+
+Outputs:
+  SourceBucketName:
+    Value: !Ref SourceBucket
+
+  S3EventTopicArn:
+    Value: !Ref S3EventTopic
+
+  CrawlerOutputBucketName:
+    Value: !Ref CrawlerOutputBucket
+
+  AthenaOutputBucketName:
+    Value: !Ref AthenaOutputBucket
+
+  FailureTopicArn:
+    Value: !Ref FailureTopic
+
+  GlueDatabaseNameUsed:
+    Value: !Ref GlueDatabaseName
+
+  SaveS3ConfigFunctionName:
+    Value: !Ref SaveS3ConfigFunction
+
+  RunGlueJobFunctionName:
+    Value: !Ref RunGlueJobFunction
