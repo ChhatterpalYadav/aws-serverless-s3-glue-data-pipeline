@@ -14,10 +14,7 @@ repository = FileConfigRepository()
 
 
 def handler(event, context):
-    """
-    Triggered by the EventBridge rule watching for Glue Job State
-    Change events with state=FAILED, across all 9 job names.
-    """
+
     detail = event.get("detail", {})
     job_name = detail.get("jobName")
     job_run_id = detail.get("jobRunId")
@@ -25,7 +22,6 @@ def handler(event, context):
 
     logger.error(f"Glue job '{job_name}' (run {job_run_id}) FAILED: {error_message}")
 
-    # Best-effort: mark the underlying file's DynamoDB record FAILED.
     config_item = repository.find_by_job_run_id(job_run_id)
     if config_item:
         repository.update_status(config_item["object_key"], config_item["version_id"], "FAILED")

@@ -25,7 +25,6 @@ CRAWLER_POLL_INTERVAL_SECONDS = 10
 
 
 def _file_type_from_job_name(job_name: str) -> str:
-    """Our Glue job names are '<type>_<sizetier>', e.g. 'csv_0_5kb' -> 'csv'."""
     return job_name.split("_")[0]
 
 
@@ -39,12 +38,7 @@ def _start_crawler_if_not_running(crawler_name: str):
 
 
 def _wait_for_crawler_ready(crawler_name: str) -> bool:
-    """
-    Crawlers run asynchronously - we poll its state until it returns
-    to READY (finished), or give up after MAX_CRAWLER_WAIT_SECONDS so
-    this Lambda doesn't run forever. This is the "crawler can wait for
-    5 mins if state is not ready" behavior from your assignment.
-    """
+    
     waited_seconds = 0
     while waited_seconds < MAX_CRAWLER_WAIT_SECONDS:
         state = glue_client.get_crawler(Name=crawler_name)["Crawler"]["State"]
@@ -58,12 +52,7 @@ def _wait_for_crawler_ready(crawler_name: str) -> bool:
 
 
 def _find_table_for_file_type(database_name: str, file_type: str):
-    """
-    Finds the Glue Catalog table the crawler created for this file
-    type, by checking which table's S3 location contains the matching
-    folder (e.g. '/csv/'). Avoids hardcoding an assumed table name,
-    since Glue's auto-naming behavior can vary.
-    """
+    
     tables = glue_client.get_tables(DatabaseName=database_name)["TableList"]
     for table in tables:
         location = table.get("StorageDescriptor", {}).get("Location", "")
@@ -73,10 +62,7 @@ def _find_table_for_file_type(database_name: str, file_type: str):
 
 
 def handler(event, context):
-    """
-    Triggered by the EventBridge rule watching for Glue Job State
-    Change events with state=SUCCEEDED, across all 9 job names.
-    """
+    
     detail = event.get("detail", {})
     job_name = detail.get("jobName")
     job_run_id = detail.get("jobRunId")
@@ -108,7 +94,6 @@ def handler(event, context):
     query_execution_id = query_execution["QueryExecutionId"]
     logger.info(f"Started Athena query '{query_execution_id}' against table '{table_name}'")
 
-    # Best-effort: mark the underlying file's DynamoDB record PROCESSED.
     config_item = repository.find_by_job_run_id(job_run_id)
     if config_item:
         repository.update_status(config_item["object_key"], config_item["version_id"], "PROCESSED")
